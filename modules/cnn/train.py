@@ -1,11 +1,3 @@
-# train.py — training loops for TennisClassifier and TennisKeypointDetector.
-#
-# Run from project root:
-#   python -m modules.cnn.train --model classifier
-#   python -m modules.cnn.train --model keypoint
-#
-# Trained weights are saved to modules/cnn/weights/.
-
 import argparse
 import time
 from pathlib import Path
@@ -26,14 +18,10 @@ DEVICE = torch.device("mps" if torch.backends.mps.is_available()
                        else "cpu")
 
 
-# Classifier training
-
 def _make_balanced_sampler(dataset: CropDataset) -> WeightedRandomSampler:
-    # Gives each class equal probability regardless of how many samples it has.
-    # Prevents the model from ignoring minority classes during training.
     counts = dataset.class_counts()
     total  = sum(counts.values())
-    class_weight = {label: total / count for label, count in counts.items() if count > 0}
+    class_weight  = {label: total / count for label, count in counts.items() if count > 0}
     sample_weights = torch.tensor(
         [class_weight[label] for _, _, label in dataset.samples]
     )
@@ -49,11 +37,10 @@ def train_classifier(
 
     train_ds = CropDataset(split="train", augment=True)
     valid_ds = CropDataset(split="valid", augment=False)
-
     print("Class counts (train):", train_ds.class_counts())
 
     sampler      = _make_balanced_sampler(train_ds)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,   num_workers=2)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,     num_workers=2)
     valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, num_workers=2)
 
     model     = TennisClassifier().to(DEVICE)
@@ -66,7 +53,6 @@ def train_classifier(
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
-        # train
         model.train()
         train_loss, correct, total = 0.0, 0, 0
         for imgs, labels in train_loader:
@@ -84,7 +70,6 @@ def train_classifier(
         train_loss /= total
         train_acc   = correct / total
 
-        # validate
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         with torch.no_grad():
@@ -98,15 +83,13 @@ def train_classifier(
 
         val_loss /= val_total
         val_acc   = val_correct / val_total
-
         scheduler.step()
 
-        elapsed = time.time() - t0
         print(
             f"Epoch {epoch:02d}/{epochs} | "
             f"train loss {train_loss:.4f} acc {train_acc:.3f} | "
             f"val loss {val_loss:.4f} acc {val_acc:.3f} | "
-            f"{elapsed:.1f}s"
+            f"{time.time() - t0:.1f}s"
         )
 
         if val_acc > best_val_acc:
@@ -119,8 +102,6 @@ def train_classifier(
     return model
 
 
-# Keypoint detector training
-
 def train_keypoint_detector(
     epochs:     int   = 30,
     lr:         float = 1e-3,
@@ -130,7 +111,6 @@ def train_keypoint_detector(
 
     train_ds = CourtKeypointDataset(split="train", img_size=320)
     valid_ds = CourtKeypointDataset(split="valid", img_size=320)
-
     print(f"Train samples: {len(train_ds)}  |  Valid samples: {len(valid_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=0)
@@ -145,14 +125,10 @@ def train_keypoint_detector(
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
-        # train
         model.train()
         train_loss, total = 0.0, 0
         for imgs, kps, vis in train_loader:
-            imgs = imgs.to(DEVICE)
-            kps  = kps.to(DEVICE)
-            vis  = vis.to(DEVICE)
-
+            imgs, kps, vis = imgs.to(DEVICE), kps.to(DEVICE), vis.to(DEVICE)
             optimizer.zero_grad()
             pred = model(imgs)
             loss = keypoint_loss(pred, kps, vis)
@@ -164,30 +140,24 @@ def train_keypoint_detector(
 
         train_loss /= total
 
-        # validate
         model.eval()
         val_loss, val_total = 0.0, 0
         with torch.no_grad():
             for imgs, kps, vis in valid_loader:
-                imgs = imgs.to(DEVICE)
-                kps  = kps.to(DEVICE)
-                vis  = vis.to(DEVICE)
+                imgs, kps, vis = imgs.to(DEVICE), kps.to(DEVICE), vis.to(DEVICE)
                 pred     = model(imgs)
                 loss     = keypoint_loss(pred, kps, vis)
                 val_loss += loss.item() * imgs.size(0)
                 val_total += imgs.size(0)
 
         val_loss /= val_total
-
         scheduler.step()
 
-        elapsed = time.time() - t0
-        # loss is in normalised [0,1] coords — multiply by 640 to get pixel error
         print(
             f"Epoch {epoch:02d}/{epochs} | "
-            f"train loss {train_loss:.6f} (~{train_loss*640:.2f}px) | "
-            f"val loss {val_loss:.6f} (~{val_loss*640:.2f}px) | "
-            f"{elapsed:.1f}s"
+            f"train {train_loss:.6f} (~{train_loss*640:.2f}px) | "
+            f"val {val_loss:.6f} (~{val_loss*640:.2f}px) | "
+            f"{time.time() - t0:.1f}s"
         )
 
         if val_loss < best_val_loss:
@@ -200,20 +170,16 @@ def train_keypoint_detector(
     return model
 
 
-# Inference helpers — load saved weights and run a forward pass
-
 def load_classifier(weights: str = "best") -> TennisClassifier:
     model = TennisClassifier()
-    path  = WEIGHTS_DIR / f"classifier_{weights}.pt"
-    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.load_state_dict(torch.load(WEIGHTS_DIR / f"classifier_{weights}.pt", map_location="cpu"))
     model.eval()
     return model
 
 
 def load_keypoint_detector(weights: str = "best") -> TennisKeypointDetector:
     model = TennisKeypointDetector()
-    path  = WEIGHTS_DIR / f"keypoint_{weights}.pt"
-    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.load_state_dict(torch.load(WEIGHTS_DIR / f"keypoint_{weights}.pt", map_location="cpu"))
     model.eval()
     return model
 
