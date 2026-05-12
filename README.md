@@ -14,8 +14,8 @@ AI tennis analysis system built in PyTorch. Five neural network modules feeding 
 |---|---|---|
 | `modules/cnn/` | ✅ Trained | Player/ball/background classifier + 15-point court keypoint detector |
 | `modules/lstm/` | ✅ Trained | Ball trajectory prediction — next position from last 8 |
-| `modules/detector/` | ✅ Built | Faster R-CNN player detection in full frames |
-| `modules/vlm/` | 🔧 In progress | VLM scene description and Q&A |
+| `modules/detector/` | ✅ Trained | Single-stage grid detector — player bounding boxes, F1 0.894 |
+| `modules/vlm/` | ✅ Ready | Qwen2-VL-2B scene description and free-form Q&A |
 | `gui/` | 🔧 In progress | Unified PyQt6 interface |
 
 ---
@@ -27,7 +27,8 @@ AI tennis analysis system built in PyTorch. Five neural network modules feeding 
 | `TennisClassifier` | 99.8% val accuracy |
 | `TennisKeypointDetector` | 0.04px average val error |
 | `BallTrajectoryLSTM` | ~12px average error (Euclidean, 1280×720) |
-| `PlayerDetector` | Train to get your own results |
+| `PlayerDetector` | F1 0.894 · Precision 0.879 · Recall 0.910 |
+| `Qwen2-VL-2B` | Pretrained — no training metric |
 
 ---
 

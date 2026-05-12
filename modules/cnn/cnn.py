@@ -21,9 +21,9 @@ class TennisCNNBackbone(nn.Module):
     def __init__(self):
         super().__init__()
         self.layers = nn.Sequential(
-            ConvBlock(3,   32),
-            ConvBlock(32,  64),
-            ConvBlock(64,  128),
+            ConvBlock(3, 32),
+            ConvBlock(32, 64),
+            ConvBlock(64, 128),
             ConvBlock(128, 256),
         )
 
@@ -84,11 +84,11 @@ class TennisKeypointDetector(nn.Module):
 
 
 def keypoint_loss(
-    pred:       torch.Tensor,
-    target:     torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
     visibility: torch.Tensor,
 ) -> torch.Tensor:
     # only penalise visible keypoints
-    mask   = visibility.unsqueeze(-1).expand_as(pred)
+    mask = visibility.unsqueeze(-1).expand_as(pred)
     sq_err = ((pred - target) ** 2) * mask
     return sq_err.sum() / mask.sum().clamp(min=1)
