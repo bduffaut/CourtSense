@@ -3,6 +3,9 @@ import torch.nn as nn
 
 
 class ConvBlock(nn.Module):
+    # One conv layer + batch norm + relu + maxpool.
+    # Every block halves the spatial size and changes the channel count.
+
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.block = nn.Sequential(
@@ -17,7 +20,10 @@ class ConvBlock(nn.Module):
 
 
 class TennisCNNBackbone(nn.Module):
-    # (B, 3, H, W) -> (B, 256, H/16, W/16)
+    # Four conv blocks stacked, each doubles channels and halves spatial size.
+    # Input  (B, 3, H, W)
+    # Output (B, 256, H/16, W/16)
+
     def __init__(self):
         super().__init__()
         self.layers = nn.Sequential(
@@ -32,13 +38,23 @@ class TennisCNNBackbone(nn.Module):
 
 
 class TennisClassifier(nn.Module):
-    # 128x128 crop -> player / ball / background
+    # Takes a 128x128 crop and classifies it as player, ball, or background.
+    # The conv layers extract features, the FC layers at the end do the classification,
+    # Classes:
+    # 0 : player
+    # 1 : ball
+    # 2 : background
+    # Input  (B, 3, 128, 128)
+    # Output (B, 3)  raw logits
+
     CLASSES = ["player", "ball", "background"]
 
     def __init__(self, dropout: float = 0.5):
         super().__init__()
         self.backbone = TennisCNNBackbone()
+
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(256, 128),
@@ -53,27 +69,32 @@ class TennisClassifier(nn.Module):
         return self.classifier(x)
 
     def predict(self, x: torch.Tensor) -> list[str]:
+        # returns class name strings
         with torch.no_grad():
             indices = self.forward(x).argmax(dim=1)
         return [self.CLASSES[i] for i in indices.tolist()]
 
 
 class TennisKeypointDetector(nn.Module):
-    # Full court image -> 15 landmark (x,y) coords, normalised to [0,1]
+    # Finds the 15 court landmark positions in a 640x640 image.
+    # Input  (B, 3, 640, 640)  or any size, adaptive pool handles it
+    # Output (B, 15, 2)
+
     NUM_KEYPOINTS = 15
 
     def __init__(self, dropout: float = 0.4):
         super().__init__()
         self.backbone = TennisCNNBackbone()
-        # 4x4 keeps spatial structure — a corner top-left has different features than bottom-right
+
         self.pool = nn.AdaptiveAvgPool2d((4, 4))
+
         self.regressor = nn.Sequential(
             nn.Flatten(),
             nn.Linear(256 * 4 * 4, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(512, self.NUM_KEYPOINTS * 2),
-            nn.Sigmoid(),
+            nn.Sigmoid(),  # keeps output in [0,1] to match normalised targets
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -83,12 +104,14 @@ class TennisKeypointDetector(nn.Module):
         return x.view(-1, self.NUM_KEYPOINTS, 2)
 
 
+# Loss for keypoint detector
 def keypoint_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     visibility: torch.Tensor,
 ) -> torch.Tensor:
-    # only penalise visible keypoints
+
     mask = visibility.unsqueeze(-1).expand_as(pred)
     sq_err = ((pred - target) ** 2) * mask
-    return sq_err.sum() / mask.sum().clamp(min=1)
+    visible_count = mask.sum().clamp(min=1)
+    return sq_err.sum() / visible_count

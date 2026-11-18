@@ -4,8 +4,5 @@ opencv-python
 Pillow
 numpy
 matplotlib
-transformers
-accelerate
-huggingface_hub
-qwen-vl-utils
-PyQt6
+streamlit
+ollama

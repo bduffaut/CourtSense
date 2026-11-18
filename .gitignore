@@ -3,10 +3,5 @@ Data/
 Models/
 __pycache__/
 *.pth
-*.pt
 .env
-.DS_Store
-
-# personal / dev docs — not for the public repo
 CLAUDE.md
-*_architecture.md
