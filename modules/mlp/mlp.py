@@ -3,7 +3,7 @@ modules/mlp/mlp.py
 
 Fully-connected MLP baseline classifier for TennisTracker.
 
-Input : 1024-d vector  (32×32 grayscale crop, flattened)
+Input : 3072-d vector  (32×32 RGB crop, flattened)
 Output: 3 logits       (player / ball / background)
 
 This is intentionally a pure MLP — no convolutions — so it can be compared
@@ -11,13 +11,15 @@ directly against TennisClassifier (CNN) to demonstrate why spatial feature
 extraction matters for image data.
 
 Architecture:
-    Linear(1024 → 512) → BatchNorm1d → ReLU → Dropout(0.5)
+    Linear(3072 → 512) → BatchNorm1d → ReLU → Dropout(0.5)
     Linear(512  → 256) → BatchNorm1d → ReLU → Dropout(0.4)
     Linear(256  → 128) → BatchNorm1d → ReLU → Dropout(0.3)
     Linear(128  → 3)
 
-Parameter count: ~690 K
-Expected val accuracy: ~65–75 % (vs CNN ~99 %)
+Colour matters: the ball's yellow-green is the strongest cue an MLP can use
+without convolutions, so crops are kept in RGB.
+
+Parameter count: ~1.7 M
 """
 
 import torch
@@ -25,7 +27,8 @@ import torch.nn as nn
 
 
 CLASSES = ["player", "ball", "background"]
-INPUT_DIM = 32 * 32   # 1024 — flattened 32×32 grayscale
+SIDE = 32
+INPUT_DIM = 3 * SIDE * SIDE   # 3072 — flattened 32×32 RGB
 
 
 class TennisMLP(nn.Module):
@@ -56,7 +59,7 @@ class TennisMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, 1024)  — pre-flattened grayscale pixel vector
+            x: (batch, 3072)  — pre-flattened RGB pixel vector
         Returns:
             logits: (batch, 3)
         """

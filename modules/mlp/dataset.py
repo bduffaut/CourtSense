@@ -1,34 +1,31 @@
 # MLP crop dataset.
-# Inherits the same player/ball/background samples as CropDataset but applies
-# a flat (non-conv) transform: grayscale 32×32 → 1024-d float vector.
+# Same player/ball/background crops as the CNN (Data/crops/), but flattened:
+# RGB 32×32 → 3072-d float vector, so the MLP sees raw pixels with no
+# spatial structure (the point of the CNN-vs-MLP comparison).
 
 import torchvision.transforms as T
-from modules.cnn.dataset import CropDataset
-from modules.mlp.mlp import INPUT_DIM
-import math
 
-_SIDE = int(math.isqrt(INPUT_DIM))   # 32
+from modules.mlp.mlp import SIDE
+from utils.datasets import CropFolderDataset
 
 
-class MLPCropDataset(CropDataset):
-    """Same crops as CropDataset, returned as flat grayscale feature vectors."""
+def _flatten(x):
+    return x.flatten()
+
+
+def mlp_transforms(train: bool):
+    aug = [T.RandomHorizontalFlip(), T.ColorJitter(0.3, 0.3, 0.2, 0.02)] if train else []
+    return T.Compose([
+        *aug,
+        T.Resize((SIDE, SIDE)),
+        T.ToTensor(),                              # (3, 32, 32) in [0, 1]
+        T.Normalize([0.5] * 3, [0.5] * 3),         # → [-1, 1]
+        T.Lambda(_flatten),                        # (3072,)
+    ])
+
+
+class MLPCropDataset(CropFolderDataset):
+    """Same crops as the CNN classifier, returned as flat RGB feature vectors."""
 
     def __init__(self, split: str = "train", augment: bool = False):
-        # Let the parent build all sample lists; ignore its transform.
-        super().__init__(split=split, augment=False)
-
-        augment_tf = []
-        if augment:
-            augment_tf = [
-                T.RandomHorizontalFlip(),
-                T.ColorJitter(brightness=0.3, contrast=0.2),
-            ]
-
-        self.transform = T.Compose([
-            *augment_tf,
-            T.Resize((_SIDE, _SIDE)),
-            T.Grayscale(num_output_channels=1),
-            T.ToTensor(),                              # (1, 32, 32)  values in [0, 1]
-            T.Normalize(mean=[0.5], std=[0.5]),        # → [-1, 1]
-            T.Lambda(lambda x: x.flatten()),           # (1024,)
-        ])
+        super().__init__(split, mlp_transforms(augment))

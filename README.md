@@ -117,26 +117,48 @@ Retrain any module from inside the app — configure epochs, learning rate, and 
 
 ## Datasets (only needed for retraining)
 
-The datasets are not included in the repository. Download them and place them at these exact paths:
+The data is **not** in the repository. One command downloads (~10 GB) and
+prepares everything into `Data/` (gitignored):
 
-| Dataset | Where to get it | Path |
+```bash
+python -m scripts.prepare_data
+```
+
+| Dataset | What it provides | Source |
 |---|---|---|
-| Tennis Player Detection (COCO) | Roboflow — *Tennis Player Detection v5* | `Data/Tennis Player Detection.v5i.coco/` |
-| Tennis Ball Trajectory | Roboflow — *TennisBallDataset* | `Data/TennisBallDataset/` |
-| Tennis Court Keypoints (COCO) | Roboflow — *tennis court v8* | `Data/tennis court.v8-7-court-dataset-missing-keypoint-exc-no-resize-.coco/` |
+| TrackNet tennis dataset (Huang et al., 2019) | ~19.8k broadcast frames (1280×720) from 10 matches, per-frame ball position | [Hugging Face mirror](https://huggingface.co/datasets/oweng/tracknet_preprocessd_data) of the [original release](https://github.com/yastrebksv/TrackNet) |
+| TennisCourtDetector (MIT) | 8,841 broadcast frames from many matches and surfaces, 14 court keypoints each | [Hugging Face mirror](https://huggingface.co/datasets/Gholamreza/tennis_court_keypoints_dataset) of [yastrebksv/TennisCourtDetector](https://github.com/yastrebksv/TennisCourtDetector) |
+
+Player boxes are pseudo-labelled (`scripts/build_detection_labels.py`): a
+COCO-pretrained Faster R-CNN finds every person, the court-keypoint CNN gives a
+homography, and per court half the person closest to the court is the player —
+ball kids, line judges and the umpire are dropped. Validation always uses
+matches the models never trained on (TrackNet games 9–10).
 
 ---
 
-## Train from the command line
+## Train
 
-Run everything from the **project root** with `-m`:
+Best on a CUDA GPU. One command runs the whole pipeline — download, labels,
+detector, classifiers, MLP — and writes `docs/TRAINING_REPORT.md`:
 
 ```bash
-python -m modules.mlp.train --epochs 40 --lr 1e-3 --batch-size 128
-python -m modules.cnn.train --model classifier --epochs 20
-python -m modules.cnn.train --model keypoint --epochs 30
-python -m modules.detector.train --epochs 20 --lr 0.005
-python -m modules.lstm.train --epochs 50 --seq-len 8
+pip install torch==2.15.0 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu132
+pip install -r requirements-train.txt
+python -m scripts.train_all            # add --smoke for a 5-minute check first
+```
+
+The court-keypoint CNN and LSTM ship already trained and are skipped unless
+`--retrain-keypoints` / `--retrain-lstm` is passed. Individual steps:
+
+```bash
+python -m modules.cnn.train --model keypoint     # court keypoints
+python -m scripts.build_detection_labels         # detector labels + classifier crops
+python -m modules.detector.train
+python -m modules.cnn.train --model classifier
+python -m modules.mlp.train
+python -m modules.lstm.train
+python -m scripts.evaluate_all                   # report
 ```
 
 ---
@@ -179,18 +201,17 @@ TennisTracker/
 ## Module overview
 
 ### MLP — `modules/mlp/`
-Pure fully-connected network with no convolutions. Input: 32×32 grayscale crop flattened to 1024 dimensions. Four linear layers with BatchNorm, ReLU, and Dropout. Serves as a baseline to show the advantage of spatial feature extraction in the CNN.
+Pure fully-connected network with no convolutions. Input: 32×32 RGB detection crop flattened to 3072 dimensions. Four linear layers with BatchNorm, ReLU, and Dropout. Serves as a baseline to show the advantage of spatial feature extraction in the CNN.
 
 ### CNN — `modules/cnn/`
-Shared `TennisCNNBackbone` (4× ConvBlock: Conv→BN→ReLU→MaxPool) with two heads:
-- **TennisClassifier**: classifies 128×128 crops into player / ball / background
-- **TennisKeypointDetector**: regresses 15 (x, y) court landmark coordinates from 320×320 images
+- **TennisClassifier**: `TennisCNNBackbone` (4× Conv→BN→ReLU→MaxPool) classifying 64×64 detection crops into player / ball / background — in the app it verifies each detection.
+- **TennisKeypointDetector**: encoder-decoder (U-Net style) CNN predicting one heatmap per court keypoint (14) at 1/4 resolution, decoded with sub-pixel refinement. Draws the court lines in the app.
 
 ### Detector — `modules/detector/`
-Faster R-CNN with ResNet-50 FPN v2 backbone. Pretrained ImageNet backbone; only the detection head is fine-tuned on the tennis dataset. Detects two classes: player (label 1) and ball (label 2).
+Faster R-CNN with ResNet-50 FPN v2 (COCO pretrained), fine-tuned for player (label 1) and ball (label 2) on broadcast frames. Runs at native 720p with a 16px smallest anchor for the tiny ball; the early ResNet stages, FPN and heads are fine-tuned, and only those weights are stored (fp16).
 
 ### LSTM — `modules/lstm/`
-2-layer LSTM with input projection and decoder head. Takes a sliding window of 8 normalised (x, y) positions and predicts the next position. Used in the GUI to draw predicted trajectories on top of tracked detections.
+2-layer LSTM over the last 8 ball positions (plus their frame-to-frame velocities) predicting the next position as a displacement. Trained only on uninterrupted visible-ball runs, split by match.
 
 ### VLM — `modules/vlm/`
 Gemma 4 multimodal model served locally via Ollama. Receives the current image/frame plus a structured detection context string (bounding boxes, scores, LSTM prediction). System-prompted as a tennis analyst to answer scene description and Q&A queries.

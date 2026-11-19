@@ -23,7 +23,9 @@ import torch
 import torchvision.transforms as T
 
 from modules.detector.train import load_detector
-from modules.cnn.train import load_classifier, load_keypoint_detector
+from modules.cnn.train import (load_classifier, load_keypoint_detector,
+                               predict_court_keypoints)
+from utils.datasets import COURT_LINES, crop_box_for
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -263,7 +265,8 @@ def get_classifier():
 
 @st.cache_resource
 def get_keypoint_detector():
-    return load_keypoint_detector(weights="best").eval()
+    _, device = get_detector()
+    return load_keypoint_detector(weights="best").to(device).eval()
 
 @st.cache_resource
 def get_mlp():
@@ -289,7 +292,17 @@ def _inference_lock():
 
 
 # ── Inference ──────────────────────────────────────────────────────────────────
-_BALL_SCORE_THRESH = 0.10   # balls are small — run at a low threshold
+def _tuned_ball_threshold(default: float = 0.3) -> float:
+    """Ball score threshold with the best validation F1 (from scripts.evaluate_all)."""
+    try:
+        import json
+        cfg = Path(__file__).parent.parent / "modules/detector/weights/detector_config.json"
+        return float(json.loads(cfg.read_text())["ball_score_threshold"])
+    except Exception:
+        return default
+
+
+_BALL_SCORE_THRESH = _tuned_ball_threshold()
 
 # Court calibration — fraction of frame height where the far/near baselines sit.
 # The stands fill the top and bottom of the frame, so raw image_y/h never reaches
@@ -305,74 +318,75 @@ def _img_to_court(cx_norm, cy_norm):
     return court_x, max(0.0, min(1.0, court_y))
 
 def run_detector_on_image(pil_image, confidence_threshold):
+    """Returns boxes/scores/labels in original pixel coords.
+
+    The image goes in at its native aspect ratio; Faster R-CNN rescales it
+    internally to 720p (the resolution it was trained at). Squashing a 16:9
+    frame into a square, as before, distorted players and shrank the ball.
+    """
     detector, device = get_detector()
     w, h = pil_image.size
-    tf = T.Compose([T.Resize((640, 640)), T.ToTensor()])
-    tensor = tf(pil_image).unsqueeze(0).to(device)
-    # Run with the lower of player/ball thresholds so we catch balls
+    tensor = T.ToTensor()(pil_image).to(device)
     raw_thresh = min(confidence_threshold / 100, _BALL_SCORE_THRESH)
     dets   = detector.detect(tensor, score_threshold=raw_thresh)
-    boxes  = dets[0]["boxes"].cpu().tolist()
-    scores = dets[0]["scores"].cpu().tolist()
-    labels = dets[0]["labels"].cpu().tolist()
-    sx, sy = w / 640, h / 640
-
-    # Minimum player box height: 8% of 640-px input (filters ball kids / crowd)
-    min_box_h = 640 * 0.08
+    boxes  = dets[0]["boxes"].tolist()
+    scores = dets[0]["scores"].tolist()
+    labels = dets[0]["labels"].tolist()
 
     players, balls = [], []
     for box, score, label in zip(boxes, scores, labels):
-        x1, y1, x2, y2 = box
         if label == 1 and score >= confidence_threshold / 100:
-            if (y2 - y1) >= min_box_h:   # size gate
-                players.append((box, score))
+            players.append((box, score))
         elif label == 2 and score >= _BALL_SCORE_THRESH:
             balls.append((box, score))
 
-    # Keep top 2 players (highest confidence), top 2 ball candidates
+    # singles: at most 2 players and 1 ball per frame
     players = sorted(players, key=lambda t: t[1], reverse=True)[:2]
-    balls   = sorted(balls,   key=lambda t: t[1], reverse=True)[:2]
-
-    fb, fs, fl = [], [], []
-    for box, score in players:
-        x1, y1, x2, y2 = box
-        fb.append([x1*sx, y1*sy, x2*sx, y2*sy]); fs.append(score); fl.append(1)
-    for box, score in balls:
-        x1, y1, x2, y2 = box
-        fb.append([x1*sx, y1*sy, x2*sx, y2*sy]); fs.append(score); fl.append(2)
+    balls   = sorted(balls,   key=lambda t: t[1], reverse=True)[:1]
+    fb = [b for b, _ in players] + [b for b, _ in balls]
+    fs = [sc for _, sc in players] + [sc for _, sc in balls]
+    fl = [1] * len(players) + [2] * len(balls)
     return fb, fs, fl
 
-def run_classifier_on_image(pil_image):
-    model = get_classifier()
-    tf = T.Compose([T.Resize((128,128)), T.ToTensor(),
-                    T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD)])
-    with torch.no_grad():
-        logits = model(tf(pil_image).unsqueeze(0))
-        probs  = torch.softmax(logits, dim=1)
-        conf, pred = torch.max(probs, dim=1)
-    return model.CLASSES[pred.item()], conf.item()
+_DET_TO_CLS = {1: "player", 2: "ball"}
 
-def run_mlp_on_image(pil_image):
-    model = get_mlp()
+
+def _classify_crops(model, tf, pil_image, boxes, labels):
+    """Classify every detection crop; returns (summary label, mean confidence).
+
+    The classifiers were trained on detection-sized crops (player / ball /
+    background), so they verify detections — running them on the whole frame,
+    as before, always answered "background".
+    """
     if model is None:
         return "Not trained", 0.0
-    tf = T.Compose([T.Resize((32,32)), T.Grayscale(), T.ToTensor(),
-                    T.Normalize([0.5],[0.5]), T.Lambda(lambda x: x.flatten())])
+    if not boxes:
+        return "No detections", 0.0
+    w, h = pil_image.size
+    crops = torch.stack([tf(pil_image.crop(crop_box_for(b, w, h))) for b in boxes])
     with torch.no_grad():
-        logits = model(tf(pil_image).unsqueeze(0))
-        probs  = torch.softmax(logits, dim=1)
-        conf, pred = torch.max(probs, dim=1)
-    return model.CLASSES[pred.item()], conf.item()
+        probs = torch.softmax(model(crops), dim=1)
+    conf, pred = probs.max(dim=1)
+    agree = sum(model.CLASSES[p] == _DET_TO_CLS.get(l) for p, l in zip(pred.tolist(), labels))
+    return f"{agree}/{len(boxes)} agree", conf.mean().item()
+
+
+_CNN_TF = T.Compose([T.Resize((64, 64)), T.ToTensor(),
+                     T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD)])
+_MLP_TF = T.Compose([T.Resize((32, 32)), T.ToTensor(),
+                     T.Normalize([0.5] * 3, [0.5] * 3), T.Lambda(lambda x: x.flatten())])
+
+
+def run_classifier_on_image(pil_image, boxes, labels):
+    return _classify_crops(get_classifier(), _CNN_TF, pil_image, boxes, labels)
+
+
+def run_mlp_on_image(pil_image, boxes, labels):
+    return _classify_crops(get_mlp(), _MLP_TF, pil_image, boxes, labels)
 
 def run_keypoint_on_image(pil_image):
-    model = get_keypoint_detector()
-    w, h = pil_image.size
-    tf = T.Compose([T.Resize((320,320)), T.ToTensor(),
-                    T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD)])
-    with torch.no_grad():
-        out = model(tf(pil_image).unsqueeze(0))
-    points = out.squeeze().cpu().tolist()
-    return [[x*w, y*h] for x, y in points]
+    """14 court keypoints in pixel coords (None where the point isn't visible)."""
+    return predict_court_keypoints(get_keypoint_detector(), pil_image)
 
 def run_lstm_prediction(trajectory):
     model = get_lstm()
@@ -381,6 +395,18 @@ def run_lstm_prediction(trajectory):
     seed = torch.tensor(trajectory[-8:], dtype=torch.float32)
     pred = model.predict_sequence(seed, steps=1)
     return pred[0].tolist()
+
+
+def _draw_court(draw, keypoints):
+    """Court lines between detected keypoints, plus the keypoints themselves."""
+    kps = keypoints or []
+    for a, b in COURT_LINES:
+        if a < len(kps) and b < len(kps) and kps[a] and kps[b]:
+            draw.line([tuple(kps[a]), tuple(kps[b])], fill=(0, 255, 220, 150), width=2)
+    for p in kps:
+        if p:
+            x, y = p
+            draw.ellipse([x-5, y-5, x+5, y+5], fill=(0, 255, 220, 220), outline=(0, 0, 0, 200))
 
 
 # ── SimpleTracker ──────────────────────────────────────────────────────────────
@@ -779,9 +805,10 @@ def process_video(video_file, confidence_threshold):
                     if tid not in player_trails_by_id:
                         player_trails_by_id[tid] = deque(maxlen=25)
                     player_trails_by_id[tid].append((cx, cy))
-                    lstm_traj.append([cx, cy])
                 for _, bbox in b_tracks.items():
-                    ball_trail.append(((bbox[0]+bbox[2])/(2*iw), (bbox[1]+bbox[3])/(2*ih)))
+                    bc = ((bbox[0]+bbox[2])/(2*iw), (bbox[1]+bbox[3])/(2*ih))
+                    ball_trail.append(bc)
+                    lstm_traj.append(list(bc))   # LSTM is trained on ball trajectories
 
                 lstm_pred = run_lstm_prediction(lstm_traj) if len(lstm_traj) >= 8 else None
 
@@ -845,8 +872,8 @@ def process_video(video_file, confidence_threshold):
 def run_full_analysis(pil_image, confidence_threshold):
     with _inference_lock():
         boxes, scores, labels = run_detector_on_image(pil_image, confidence_threshold)
-        cnn_label, cnn_conf   = run_classifier_on_image(pil_image)
-        mlp_label, mlp_conf   = run_mlp_on_image(pil_image)
+        cnn_label, cnn_conf   = run_classifier_on_image(pil_image, boxes, labels)
+        mlp_label, mlp_conf   = run_mlp_on_image(pil_image, boxes, labels)
         keypoints             = run_keypoint_on_image(pil_image)
 
     st.session_state.detector_boxes        = boxes
@@ -859,7 +886,9 @@ def run_full_analysis(pil_image, confidence_threshold):
     st.session_state.mlp_label             = mlp_label
     st.session_state.mlp_confidence        = mlp_conf
     iw, ih = pil_image.size
-    for box in boxes:
+    for box, label in zip(boxes, labels):
+        if label != 2:      # the LSTM is trained on ball trajectories only
+            continue
         x1, y1, x2, y2 = box
         st.session_state.trajectory_history.append([((x1+x2)/2)/iw, ((y1+y2)/2)/ih])
     st.session_state.trajectory_prediction = run_lstm_prediction(
@@ -1172,10 +1201,7 @@ with preview_tab:
                         if label == 1:
                             p_idx += 1
                 if show_keypoints:
-                    kp_draw = ImageDraw.Draw(out_img, "RGBA")
-                    for x, y in st.session_state.keypoints:
-                        kp_draw.ellipse([x-5, y-5, x+5, y+5],
-                                        fill=(0, 255, 220, 200), outline=(0, 0, 0, 200))
+                    _draw_court(ImageDraw.Draw(out_img, "RGBA"), st.session_state.keypoints)
                 st.image(out_img, use_container_width=True)
             else:
                 st.markdown(
@@ -1309,8 +1335,7 @@ with preview_tab:
                         draw.text((x1+2,max(0,y1-16)),
                                   f"{names.get(label,'?')} {score:.2f}", fill=rgb+(255,))
                 if show_keypoints_c:
-                    for x,y in st.session_state.keypoints:
-                        draw.ellipse([x-5,y-5,x+5,y+5], fill=(0,255,220,200))
+                    _draw_court(draw, st.session_state.keypoints)
                 st.image(out_img, use_container_width=True)
             else:
                 st.markdown(

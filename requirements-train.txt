@@ -1,0 +1,7 @@
+# Training dependencies. Install PyTorch first, matching your GPU, e.g.:
+#   pip install torch==2.15.0 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu132
+opencv-python
+Pillow
+numpy
+matplotlib
+streamlit

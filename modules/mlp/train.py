@@ -14,10 +14,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
 from modules.mlp.mlp import TennisMLP
 from modules.mlp.dataset import MLPCropDataset
+from modules.cnn.train import evaluate_classifier, make_balanced_sampler
 
 WEIGHTS_DIR = Path(__file__).parent / "weights"
 WEIGHTS_DIR.mkdir(exist_ok=True)
@@ -29,20 +30,6 @@ DEVICE = torch.device(
 )
 
 
-def _make_balanced_sampler(dataset: MLPCropDataset) -> WeightedRandomSampler:
-    counts = dataset.class_counts()
-    total = sum(counts.values())
-    class_weight = {
-        label: total / count for label, count in counts.items() if count > 0
-    }
-    sample_weights = torch.tensor(
-        [class_weight[label] for _, _, label in dataset.samples]
-    )
-    return WeightedRandomSampler(
-        sample_weights, num_samples=len(sample_weights), replacement=True
-    )
-
-
 def train(
     epochs: int = 40,
     lr: float = 1e-3,
@@ -52,16 +39,18 @@ def train(
     print(f"Device: {DEVICE}")
 
     train_ds = MLPCropDataset(split="train", augment=True)
-    valid_ds = MLPCropDataset(split="valid", augment=False)
+    valid_ds = MLPCropDataset(split="val", augment=False)
 
     print("Class counts (train):", train_ds.class_counts())
 
-    sampler = _make_balanced_sampler(train_ds)
+    sampler = make_balanced_sampler(train_ds)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, sampler=sampler, num_workers=0
+        train_ds, batch_size=batch_size, sampler=sampler, num_workers=4,
+        persistent_workers=True,
     )
     valid_loader = DataLoader(
-        valid_ds, batch_size=batch_size, shuffle=False, num_workers=0
+        valid_ds, batch_size=batch_size, shuffle=False, num_workers=4,
+        persistent_workers=True,
     )
 
     model = TennisMLP().to(DEVICE)
@@ -90,26 +79,15 @@ def train(
         train_loss /= total
         train_acc = correct / total
 
-        model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        with torch.no_grad():
-            for features, labels in valid_loader:
-                features, labels = features.to(DEVICE), labels.to(DEVICE)
-                logits = model(features)
-                loss = criterion(logits, labels)
-                val_loss += loss.item() * features.size(0)
-                val_correct += (logits.argmax(1) == labels).sum().item()
-                val_total += features.size(0)
-
-        val_loss /= val_total
-        val_acc = val_correct / val_total
+        val_acc, per_class = evaluate_classifier(model, valid_loader, DEVICE)
         scheduler.step()
 
         elapsed = time.time() - t0
         print(
             f"Epoch {epoch:02d}/{epochs} | "
             f"train loss {train_loss:.4f} acc {train_acc:.3f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.3f} | "
+            f"val acc {val_acc:.3f} (player {per_class[0]:.3f} ball {per_class[1]:.3f} "
+            f"bg {per_class[2]:.3f}) | "
             f"{elapsed:.1f}s"
         )
 
@@ -118,8 +96,7 @@ def train(
             torch.save(model.state_dict(), WEIGHTS_DIR / "mlp_best.pt")
             print(f"  saved (val_acc {val_acc:.3f})")
 
-    torch.save(model.state_dict(), WEIGHTS_DIR / "mlp_final.pt")
-    print(f"\nDone. Best val accuracy: {best_val_acc:.3f}")
+    print(f"\nDone. Best val accuracy (class-balanced): {best_val_acc:.3f}")
     return model
 
 

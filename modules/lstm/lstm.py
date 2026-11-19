@@ -30,6 +30,9 @@ class TrajectoryLSTM(nn.Module):
         dropout     : dropout between LSTM layers (default 0.2)
     """
 
+    # velocities are ~0.01 in normalised units; scale them to ~1 for the network
+    VEL_SCALE = 50.0
+
     def __init__(
         self,
         input_size: int = 2,
@@ -42,7 +45,7 @@ class TrajectoryLSTM(nn.Module):
         self.num_layers = num_layers
 
         self.input_proj = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
+            nn.Linear(input_size * 2, hidden_size),   # position + velocity
             nn.ReLU(),
         )
 
@@ -64,15 +67,21 @@ class TrajectoryLSTM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, seq_len, 2)
+            x: (batch, seq_len, 2) absolute normalised positions
         Returns:
-            predictions: (batch, 1, 2)
+            predictions: (batch, 1, 2) absolute next position
+
+        The network sees positions *and* frame-to-frame velocities, and predicts
+        the displacement from the last position (a residual), which is much
+        easier to learn than an absolute screen position.
         """
-        projected = self.input_proj(x)           # (batch, seq_len, hidden)
+        vel = torch.diff(x, dim=1, prepend=x[:, :1])          # (batch, seq_len, 2)
+        feats = torch.cat([x, vel * self.VEL_SCALE], dim=-1)   # (batch, seq_len, 4)
+        projected = self.input_proj(feats)        # (batch, seq_len, hidden)
         lstm_out, _ = self.lstm(projected)        # (batch, seq_len, hidden)
         last_hidden = lstm_out[:, -1, :]          # (batch, hidden)
-        out = self.decoder(last_hidden)           # (batch, 2)
-        return out.unsqueeze(1)                   # (batch, 1, 2)
+        delta = self.decoder(last_hidden) / self.VEL_SCALE    # (batch, 2)
+        return (x[:, -1] + delta).unsqueeze(1)    # (batch, 1, 2)
 
     def predict_sequence(
         self,

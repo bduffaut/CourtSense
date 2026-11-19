@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from utils.datasets import BallTrajectoryDataset
 from modules.lstm.lstm import TrajectoryLSTM
@@ -47,13 +47,12 @@ def train(
     print(f"Training on {dev}")
 
     # -- Data ------------------------------------------------------------------
-    full_ds = BallTrajectoryDataset(seq_len=seq_len)
-    n_val = max(1, int(len(full_ds) * val_split))
-    n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(
-        full_ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
+    # Split by match (games 1-8 / 9-10): overlapping windows from the same rally
+    # would otherwise appear in both sets and make validation meaningless.
+    train_ds = BallTrajectoryDataset("train", seq_len=seq_len, augment=True)
+    val_ds = BallTrajectoryDataset("val", seq_len=seq_len)
+    print(f"Windows: train {len(train_ds)} | val {len(val_ds)}")
+    print(f"Baseline (constant velocity) val error: {_const_velocity_px(val_ds):.2f}px")
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=0,
@@ -71,11 +70,11 @@ def train(
         dropout=dropout,
     ).to(dev)
 
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5,
-    )
+    # Huber in pixel-ish units: robust to the occasional bounce / hit, where the
+    # next position is genuinely unpredictable from the past
+    criterion = nn.SmoothL1Loss(beta=0.005)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     best_val_loss = float("inf")
@@ -102,16 +101,8 @@ def train(
 
         # -- Validate --
         model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for sequences, targets in val_loader:
-                sequences = sequences.to(dev)
-                targets = targets.unsqueeze(1).to(dev)
-                preds = model(sequences)
-                val_loss += criterion(preds, targets).item() * sequences.size(0)
-        val_loss /= len(val_ds)
-
-        scheduler.step(val_loss)
+        val_loss = _pixel_error(model, val_loader, dev)   # mean px error @1280x720
+        scheduler.step()
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -121,15 +112,37 @@ def train(
 
         print(
             f"Epoch {epoch:03d}/{epochs}  "
-            f"train={train_loss:.6f}  val={val_loss:.6f}"
+            f"train={train_loss:.6f}  val error={val_loss:.2f}px"
             + (" * best" if is_best else "")
         )
 
-    print(f"\nBest val MSE: {best_val_loss:.6f}")
+    print(f"\nBest val error: {best_val_loss:.2f}px "
+          f"(constant-velocity baseline {_const_velocity_px(val_ds):.2f}px)")
     model.load_state_dict(
         torch.load(WEIGHTS_DIR / "lstm_best.pt", map_location=dev, weights_only=True)
     )
     return model
+
+
+_SCALE = torch.tensor([BallTrajectoryDataset.IMG_W, BallTrajectoryDataset.IMG_H],
+                      dtype=torch.float32)
+
+
+@torch.no_grad()
+def _pixel_error(model, loader, dev) -> float:
+    total, n = 0.0, 0
+    for seq, tgt in loader:
+        pred = model(seq.to(dev)).squeeze(1).cpu()
+        total += ((pred - tgt) * _SCALE).norm(dim=-1).sum().item()
+        n += len(tgt)
+    return total / max(n, 1)
+
+
+def _const_velocity_px(ds) -> float:
+    """Error of the trivial 'keep moving at the same speed' predictor."""
+    seqs = torch.stack([w[0] for w in ds.windows]); tgts = torch.stack([w[1] for w in ds.windows])
+    pred = seqs[:, -1] + (seqs[:, -1] - seqs[:, -2])
+    return ((pred - tgts) * _SCALE).norm(dim=-1).mean().item()
 
 
 def load_lstm(
@@ -164,7 +177,6 @@ def load_lstm(
     path = WEIGHTS_DIR / f"lstm_{checkpoint}.pt"
     model.load_state_dict(torch.load(path, map_location=dev, weights_only=True))
     model.to(dev).eval()
-    print(f"Loaded LSTM from {path}")
     return model
 
 

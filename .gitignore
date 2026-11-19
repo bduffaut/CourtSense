@@ -5,3 +5,8 @@ __pycache__/
 *.pth
 .env
 CLAUDE.md
+logs/
+
+# training by-products (only *_best.pt are used by the app)
+modules/*/weights/*_last.pt
+modules/*/weights/*_final.pt
