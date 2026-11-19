@@ -194,3 +194,23 @@ Faster R-CNN with ResNet-50 FPN v2 backbone. Pretrained ImageNet backbone; only 
 
 ### VLM — `modules/vlm/`
 Gemma 4 multimodal model served locally via Ollama. Receives the current image/frame plus a structured detection context string (bounding boxes, scores, LSTM prediction). System-prompted as a tennis analyst to answer scene description and Q&A queries.
+
+---
+
+## Hosted demo (Docker)
+
+The repo ships a `Dockerfile` and `docker-compose.yml` for the public image-only demo
+(courtsense.benduffaut.com).
+
+```bash
+docker compose up -d --build     # serves on http://localhost:8080
+```
+
+`COURTSENSE_DEMO=1` (set by default in the image) limits the app to **Image mode** and hides
+the Chat and Training tabs. Uploads are capped at 10 MB, inference runs one image at a time,
+and `COURTSENSE_TORCH_THREADS` caps CPU threads. The COCO backbone weights are baked into the
+image at build time, so the container starts without internet access.
+
+The compose file builds the CUDA variant (`TORCH_VARIANT: cu132`) and reserves one NVIDIA GPU,
+which requires `nvidia-container-toolkit` and an R580+ driver on the host. To run on CPU only,
+set `TORCH_VARIANT: cpu` and remove the `deploy` block.

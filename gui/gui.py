@@ -3,7 +3,7 @@ Tennis Tracker — Streamlit GUI
 Launch: streamlit run gui/gui.py
 """
 
-import io, os, sys, time, tempfile, contextlib
+import io, os, sys, time, tempfile, contextlib, threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +22,6 @@ from PIL import Image, ImageDraw, ImageFont
 import torch
 import torchvision.transforms as T
 
-from modules.vlm.vlm_service import ask_vlm
 from modules.detector.train import load_detector
 from modules.cnn.train import load_classifier, load_keypoint_detector
 
@@ -38,7 +37,14 @@ _PLAYER_COLORS = ["#00FF87", "#FF6B6B", "#FFE66D", "#A78BFA"]
 _BALL_COLOR    = "#00D4FF"
 _PRED_COLOR    = "#FF8C00"
 
-st.set_page_config(page_title="TennisTracker", page_icon=None, layout="wide")
+# ── Hosted demo mode ───────────────────────────────────────────────────────────
+# COURTSENSE_DEMO=1 → image-only, no Training / Chat tabs (public deployment).
+DEMO_MODE = os.environ.get("COURTSENSE_DEMO", "0").lower() in ("1", "true", "yes")
+_TORCH_THREADS = os.environ.get("COURTSENSE_TORCH_THREADS")
+if _TORCH_THREADS:
+    torch.set_num_threads(int(_TORCH_THREADS))
+
+st.set_page_config(page_title="CourtSense", page_icon=None, layout="wide")
 
 st.markdown("""
 <style>
@@ -274,6 +280,12 @@ def get_lstm():
         return None
     from modules.lstm.train import load_lstm
     return load_lstm(checkpoint="best").eval()
+
+
+@st.cache_resource
+def _inference_lock():
+    """One lock shared by every session — inference runs one image at a time."""
+    return threading.Lock()
 
 
 # ── Inference ──────────────────────────────────────────────────────────────────
@@ -831,10 +843,11 @@ def process_video(video_file, confidence_threshold):
 
 # ── Full-image analysis ────────────────────────────────────────────────────────
 def run_full_analysis(pil_image, confidence_threshold):
-    boxes, scores, labels = run_detector_on_image(pil_image, confidence_threshold)
-    cnn_label, cnn_conf   = run_classifier_on_image(pil_image)
-    mlp_label, mlp_conf   = run_mlp_on_image(pil_image)
-    keypoints             = run_keypoint_on_image(pil_image)
+    with _inference_lock():
+        boxes, scores, labels = run_detector_on_image(pil_image, confidence_threshold)
+        cnn_label, cnn_conf   = run_classifier_on_image(pil_image)
+        mlp_label, mlp_conf   = run_mlp_on_image(pil_image)
+        keypoints             = run_keypoint_on_image(pil_image)
 
     st.session_state.detector_boxes        = boxes
     st.session_state.detector_scores       = scores
@@ -966,9 +979,10 @@ def _capture_and_train(fn, **kwargs):
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown(
     '<div style="display:flex;align-items:center;gap:10px;padding:2px 0 2px;margin-bottom:6px">'
-    '<span style="font-size:14px;font-weight:700;color:#111">TennisTracker</span>'
+    '<span style="font-size:14px;font-weight:700;color:#111">CourtSense</span>'
     '<div style="width:1px;height:13px;background:#ddd;margin:0 4px;flex-shrink:0"></div>'
-    '<span style="font-size:11px;color:#999">Faster R-CNN · CNN · MLP · LSTM · VLM</span>'
+    '<span style="font-size:11px;color:#999">Faster R-CNN · CNN · MLP · LSTM'
+    + ('' if DEMO_MODE else ' · VLM') + '</span>'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -988,7 +1002,7 @@ _mlp_ok  = mlp_ready
 # Brand
 st.sidebar.markdown(
     '<div class="tt-brand">'
-    '<div class="tt-brand-name">TennisTracker</div>'
+    '<div class="tt-brand-name">CourtSense</div>'
     '<div class="tt-brand-sub">AI Analysis System · USJ</div>'
     '</div>',
     unsafe_allow_html=True,
@@ -1010,7 +1024,8 @@ st.sidebar.markdown(
 
 # INPUT section
 st.sidebar.markdown('<div class="tt-section" style="margin-top:18px">Input Mode</div>', unsafe_allow_html=True)
-input_mode = st.sidebar.radio("", ["Image", "Video", "Camera"], label_visibility="collapsed")
+_input_modes = ["Image"] if DEMO_MODE else ["Image", "Video", "Camera"]
+input_mode = st.sidebar.radio("", _input_modes, label_visibility="collapsed")
 
 uploaded_image = None
 uploaded_video = None
@@ -1054,9 +1069,13 @@ if st.sidebar.button("Clear Data", use_container_width=True):
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-preview_tab, court_tab, chat_tab, training_tab, logs_tab = st.tabs(
-    ["Tracking", "Court View", "Chat", "Training", "Logs"]
-)
+if DEMO_MODE:
+    preview_tab, court_tab, logs_tab = st.tabs(["Tracking", "Court View", "Logs"])
+    chat_tab = training_tab = None
+else:
+    preview_tab, court_tab, chat_tab, training_tab, logs_tab = st.tabs(
+        ["Tracking", "Court View", "Chat", "Training", "Logs"]
+    )
 
 
 # ─────────────────────────────────────────────
@@ -1374,131 +1393,134 @@ with court_tab:
 # ─────────────────────────────────────────────
 # TAB 3 — VLM CHAT
 # ─────────────────────────────────────────────
-with chat_tab:
+if chat_tab is not None:
+    with chat_tab:
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-    prompt = st.chat_input("Ask something about the tennis scene…")
-    if prompt:
-        st.session_state.messages.append({"role":"user","content":prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
-                # ── Pick the best available image for VLM context ──────
-                image_file = None
-                if input_mode == "Image" and uploaded_image:
-                    uploaded_image.seek(0)
-                    image_file = uploaded_image
-                elif input_mode == "Video" and st.session_state.video_frame:
-                    st.session_state.video_frame.seek(0)
-                    image_file = st.session_state.video_frame
-                elif input_mode == "Camera" and st.session_state.base_image:
-                    _cam_buf = io.BytesIO()
-                    st.session_state.base_image.save(_cam_buf, format="JPEG", quality=90)
-                    _cam_buf.seek(0)
-                    image_file = _cam_buf
+        prompt = st.chat_input("Ask something about the tennis scene…")
+        if prompt:
+            st.session_state.messages.append({"role":"user","content":prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    # ── Pick the best available image for VLM context ──────
+                    image_file = None
+                    if input_mode == "Image" and uploaded_image:
+                        uploaded_image.seek(0)
+                        image_file = uploaded_image
+                    elif input_mode == "Video" and st.session_state.video_frame:
+                        st.session_state.video_frame.seek(0)
+                        image_file = st.session_state.video_frame
+                    elif input_mode == "Camera" and st.session_state.base_image:
+                        _cam_buf = io.BytesIO()
+                        st.session_state.base_image.save(_cam_buf, format="JPEG", quality=90)
+                        _cam_buf.seek(0)
+                        image_file = _cam_buf
 
-                # ── Build detection context ────────────────────────────
-                detection_ctx = None
-                if input_mode == "Video" and st.session_state.video_stats:
-                    vs = st.session_state.video_stats
-                    n = len(vs)
-                    n_players_max = max((s["n_players"] for s in vs), default=0)
-                    ball_frames   = sum(1 for s in vs if s["n_balls"] > 0)
-                    lstm_frames   = sum(1 for s in vs if s["lstm_pred"] is not None)
-                    detection_ctx = (
-                        f"Video analysis over {n} frames: "
-                        f"up to {n_players_max} player(s) detected, "
-                        f"ball tracked in {ball_frames}/{n} frames, "
-                        f"LSTM trajectory prediction active for {lstm_frames} frames. "
-                        f"The attached image is a representative mid-video frame."
-                    )
-                elif st.session_state.player_count > 0:
-                    boxes_str = "; ".join(
-                        f"box{i+1}=[{b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}] score={s:.2f}"
-                        for i,(b,s) in enumerate(zip(
-                            st.session_state.detector_boxes,
-                            st.session_state.detector_scores,
-                        ))
-                    )
-                    detection_ctx = (
-                        f"{st.session_state.player_count} object(s) detected: {boxes_str}. "
-                        f"CNN={st.session_state.classifier_label}"
-                        f"({st.session_state.classifier_confidence:.2f}), "
-                        f"MLP={st.session_state.mlp_label}"
-                        f"({st.session_state.mlp_confidence:.2f})."
-                    )
-                    if st.session_state.trajectory_prediction:
-                        px, py = st.session_state.trajectory_prediction
-                        detection_ctx += f" LSTM predicts next position ({px:.3f},{py:.3f})."
+                    # ── Build detection context ────────────────────────────
+                    detection_ctx = None
+                    if input_mode == "Video" and st.session_state.video_stats:
+                        vs = st.session_state.video_stats
+                        n = len(vs)
+                        n_players_max = max((s["n_players"] for s in vs), default=0)
+                        ball_frames   = sum(1 for s in vs if s["n_balls"] > 0)
+                        lstm_frames   = sum(1 for s in vs if s["lstm_pred"] is not None)
+                        detection_ctx = (
+                            f"Video analysis over {n} frames: "
+                            f"up to {n_players_max} player(s) detected, "
+                            f"ball tracked in {ball_frames}/{n} frames, "
+                            f"LSTM trajectory prediction active for {lstm_frames} frames. "
+                            f"The attached image is a representative mid-video frame."
+                        )
+                    elif st.session_state.player_count > 0:
+                        boxes_str = "; ".join(
+                            f"box{i+1}=[{b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}] score={s:.2f}"
+                            for i,(b,s) in enumerate(zip(
+                                st.session_state.detector_boxes,
+                                st.session_state.detector_scores,
+                            ))
+                        )
+                        detection_ctx = (
+                            f"{st.session_state.player_count} object(s) detected: {boxes_str}. "
+                            f"CNN={st.session_state.classifier_label}"
+                            f"({st.session_state.classifier_confidence:.2f}), "
+                            f"MLP={st.session_state.mlp_label}"
+                            f"({st.session_state.mlp_confidence:.2f})."
+                        )
+                        if st.session_state.trajectory_prediction:
+                            px, py = st.session_state.trajectory_prediction
+                            detection_ctx += f" LSTM predicts next position ({px:.3f},{py:.3f})."
 
-                try:
-                    response_text = ask_vlm(prompt, image_file,
-                                            detection_context=detection_ctx)
-                    add_log("VLM prompt sent successfully")
-                except Exception as e:
-                    response_text = f"VLM error: {e}"
-                    add_log(f"VLM error: {e}", "ERROR")
-            st.markdown(response_text)
-        st.session_state.messages.append({"role":"assistant","content":response_text})
+                    try:
+                        from modules.vlm.vlm_service import ask_vlm
+                        response_text = ask_vlm(prompt, image_file,
+                                                detection_context=detection_ctx)
+                        add_log("VLM prompt sent successfully")
+                    except Exception as e:
+                        response_text = f"VLM error: {e}"
+                        add_log(f"VLM error: {e}", "ERROR")
+                st.markdown(response_text)
+            st.session_state.messages.append({"role":"assistant","content":response_text})
 
 
 # ─────────────────────────────────────────────
 # TAB 4 — TRAINING
 # ─────────────────────────────────────────────
-with training_tab:
-    st.markdown('<div class="tt-section" style="margin-top:0">Train a Module</div>', unsafe_allow_html=True)
-    module_choice = st.selectbox("Module", [
-        "MLP",
-        "CNN Classifier",
-        "CNN Keypoints",
-        "LSTM",
-        "Detector (Faster R-CNN)",
-    ])
-    defaults_map = {
-        "MLP":                    (40,  1e-3,  128),
-        "CNN Classifier":         (20,  1e-3,   32),
-        "CNN Keypoints":          (30,  1e-3,    8),
-        "LSTM":                   (50,  1e-3,   64),
-        "Detector (Faster R-CNN)":(20,  5e-3,    4),
-    }
-    def_e, def_l, def_b = defaults_map[module_choice]
-    col_e, col_l, col_b = st.columns(3)
-    with col_e: t_epochs = st.number_input("Epochs",     1,   200, def_e)
-    with col_l: t_lr     = st.number_input("LR",    1e-5, 0.1, def_l, format="%.5f")
-    with col_b: t_batch  = st.number_input("Batch",      1,   512, def_b)
+if training_tab is not None:
+    with training_tab:
+        st.markdown('<div class="tt-section" style="margin-top:0">Train a Module</div>', unsafe_allow_html=True)
+        module_choice = st.selectbox("Module", [
+            "MLP",
+            "CNN Classifier",
+            "CNN Keypoints",
+            "LSTM",
+            "Detector (Faster R-CNN)",
+        ])
+        defaults_map = {
+            "MLP":                    (40,  1e-3,  128),
+            "CNN Classifier":         (20,  1e-3,   32),
+            "CNN Keypoints":          (30,  1e-3,    8),
+            "LSTM":                   (50,  1e-3,   64),
+            "Detector (Faster R-CNN)":(20,  5e-3,    4),
+        }
+        def_e, def_l, def_b = defaults_map[module_choice]
+        col_e, col_l, col_b = st.columns(3)
+        with col_e: t_epochs = st.number_input("Epochs",     1,   200, def_e)
+        with col_l: t_lr     = st.number_input("LR",    1e-5, 0.1, def_l, format="%.5f")
+        with col_b: t_batch  = st.number_input("Batch",      1,   512, def_b)
 
-    if st.button("Train", type="primary"):
-        add_log(f"Starting: {module_choice} | epochs={t_epochs} lr={t_lr} batch={t_batch}")
-        with st.spinner(f"Training {module_choice}…"):
-            if module_choice == "MLP":
-                from modules.mlp.train import train as _train
-                out = _capture_and_train(_train, epochs=int(t_epochs),
-                                         lr=float(t_lr), batch_size=int(t_batch))
-            elif module_choice == "CNN Classifier":
-                from modules.cnn.train import train_classifier as _train
-                out = _capture_and_train(_train, epochs=int(t_epochs),
-                                         lr=float(t_lr), batch_size=int(t_batch))
-            elif module_choice == "CNN Keypoints":
-                from modules.cnn.train import train_keypoint_detector as _train
-                out = _capture_and_train(_train, epochs=int(t_epochs),
-                                         lr=float(t_lr), batch_size=int(t_batch))
-            elif module_choice == "LSTM":
-                from modules.lstm.train import train as _train
-                out = _capture_and_train(_train, epochs=int(t_epochs),
-                                         lr=float(t_lr), batch_size=int(t_batch))
-            elif module_choice == "Detector (Faster R-CNN)":
-                from modules.detector.train import train as _train
-                out = _capture_and_train(_train, epochs=int(t_epochs),
-                                         lr=float(t_lr), batch_size=int(t_batch))
-        for line in out.strip().splitlines():
-            add_log(line)
-        st.success("Done — weights saved. Check Logs tab.")
-        st.cache_resource.clear()
-        st.rerun()
+        if st.button("Train", type="primary"):
+            add_log(f"Starting: {module_choice} | epochs={t_epochs} lr={t_lr} batch={t_batch}")
+            with st.spinner(f"Training {module_choice}…"):
+                if module_choice == "MLP":
+                    from modules.mlp.train import train as _train
+                    out = _capture_and_train(_train, epochs=int(t_epochs),
+                                             lr=float(t_lr), batch_size=int(t_batch))
+                elif module_choice == "CNN Classifier":
+                    from modules.cnn.train import train_classifier as _train
+                    out = _capture_and_train(_train, epochs=int(t_epochs),
+                                             lr=float(t_lr), batch_size=int(t_batch))
+                elif module_choice == "CNN Keypoints":
+                    from modules.cnn.train import train_keypoint_detector as _train
+                    out = _capture_and_train(_train, epochs=int(t_epochs),
+                                             lr=float(t_lr), batch_size=int(t_batch))
+                elif module_choice == "LSTM":
+                    from modules.lstm.train import train as _train
+                    out = _capture_and_train(_train, epochs=int(t_epochs),
+                                             lr=float(t_lr), batch_size=int(t_batch))
+                elif module_choice == "Detector (Faster R-CNN)":
+                    from modules.detector.train import train as _train
+                    out = _capture_and_train(_train, epochs=int(t_epochs),
+                                             lr=float(t_lr), batch_size=int(t_batch))
+            for line in out.strip().splitlines():
+                add_log(line)
+            st.success("Done — weights saved. Check Logs tab.")
+            st.cache_resource.clear()
+            st.rerun()
 
 
 

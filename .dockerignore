@@ -1,0 +1,13 @@
+.git
+.venv
+**/__pycache__
+**/.DS_Store
+notebooks
+Data
+Models
+.env
+.streamlit
+gui/.streamlit
+modules/*/weights/*_last.pt
+modules/*/weights/*_final.pt
+*.md

@@ -1,0 +1,22 @@
+services:
+  courtsense:
+    build:
+      context: .
+      args:
+        TORCH_VARIANT: cu132   # set to "cpu" to run without the GPU
+    image: courtsense:latest
+    container_name: courtsense
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      COURTSENSE_DEMO: "1"
+      COURTSENSE_TORCH_THREADS: "6"
+    mem_limit: 4g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
