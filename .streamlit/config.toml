@@ -1,2 +1,11 @@
 [server]
 maxUploadSize = 2000
+
+# The GUI's custom CSS is designed for a light palette; pin the theme so
+# browsers in dark mode don't get white-on-white text.
+[theme]
+base = "light"
+primaryColor = "#1d4ed8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f5f5"
+textColor = "#111111"

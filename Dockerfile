@@ -37,6 +37,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # container starts offline and doesn't re-download on every restart.
 RUN python -c "from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights as W; fasterrcnn_resnet50_fpn_v2(weights=W.DEFAULT)"
 
+COPY .streamlit/ .streamlit/
 COPY gui/ gui/
 COPY modules/ modules/
 COPY utils/ utils/
